@@ -1,0 +1,15 @@
+# /etc/default/orca-auto-update
+# orca-auto-update の設定。install.sh が無ければこの内容で作る。
+
+# orca serve を動かすユーザ(必須)。linger もこのユーザに対して有効化する
+ORCA_SVC_USER=
+
+# 以下は既定値。変えるときだけコメントを外す
+#ORCA_BASE=/opt/orca                  # 展開済みツリー(squashfs-root)を置くディレクトリ
+#ORCA_SERVICE=orca-serve              # orca serve の system unit 名
+#ORCA_PORT=6768                       # orca serve の待ち受けポート(起動確認に使う)
+#ORCA_MIN_AGE_H=24                    # 公開から この時間たった版だけを入れる
+#ORCA_KEEP_OLD=2                      # 保持する旧ツリー数・プロファイル退避数
+#ORCA_REPO=stablyai/orca              # リリース元の GitHub リポジトリ
+#ORCA_PROFILE=                        # 既定は <ユーザのホーム>/.config/orca
+#ORCA_STATE_DIR=/var/lib/orca-auto-update

@@ -1,0 +1,9 @@
+[Unit]
+Description=Orca headless server の自動更新(毎日 04:00 JST)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 Asia/Tokyo
+Persistent=true
+
+[Install]
+WantedBy=timers.target

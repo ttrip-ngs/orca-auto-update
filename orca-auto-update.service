@@ -1,0 +1,9 @@
+[Unit]
+Description=Orca headless server の自動更新 (/opt/orca/squashfs-root)
+After=network-online.target orca-serve.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/orca-auto-update
+TimeoutStartSec=45min

@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: pipx install pre-commit
+      - run: pre-commit run --all-files --show-diff-on-failure
+      - run: systemd-analyze verify --man=no ./orca-auto-update.timer ./orca-auto-update.service 2>&1 | { grep -v '/usr/local/sbin/orca-auto-update' || true; } | tee /dev/stderr | { ! grep -q .; }
+
+  failure-paths:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash /src/tests/failure-paths.sh

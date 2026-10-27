@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# Orca headless server (Linux x86_64) の自動更新
+#
+# 設定は /etc/default/orca-auto-update(ORCA_SVC_USER は必須。他は既定値あり。config.example 参照)。
+# orca-auto-update.timer から root で毎日実行する。手動実行・ロールバックも専用 unit 経由で行う
+# (直接 sudo 実行すると、端末切断の SIGHUP で停止と起動の間に死ぬことがある):
+#   sudo systemctl start orca-auto-update.service          # 今すぐ確認・更新(公開からの経過時間待ちは有効)
+#   sudo systemd-run --wait --collect -u orca-auto-update-now /usr/local/sbin/orca-auto-update --no-wait
+#                                                          # 経過時間待ちを飛ばして今すぐ更新
+#   sudo systemd-run --wait --collect -u orca-auto-update-rb /usr/local/sbin/orca-auto-update --rollback <version>
+#                                                          # 保持している旧ツリーへ戻し、戻した元の版を見送り、自動更新を保留する
+#   sudo rm /var/lib/orca-auto-update/hold                 # 保留を解除する
+#   sudo rm /var/lib/orca-auto-update/failed-<version>     # 見送った版を再試行させる
+#   journalctl -u orca-auto-update -u orca-auto-update-now -u orca-auto-update-rb   # 結果
+#
+# 前提:
+#   - ExecStart は展開済み /opt/orca/squashfs-root/AppRun(libfuse2 が無く AppImage を直接実行できない)。
+#     Linux の headless serve は Orca 本体の画面から更新できない(resolveUpdateInstallMode が darwin 限定)。
+#   - linger が有効なら terminal daemon は user scope に居るので、再起動で claude セッションは落ちない。
+#     無効だと daemon が orca-serve の cgroup に残り、停止で全セッションが落ちる(検証で警告を出す)。
+#   - 停止中の操作は squashfs-root の mv 2本だけ。展開・配置・スモークテストは稼働中に済ませる。
+#   - 取得物は root で実行しない。展開は unsquashfs で行い、スモークテストはサービスユーザで行う。
+#     sha512 は同じリリースから取るので転送の完全性しか保証しない(真正性は受容したリスク。24時間待ちで緩和)。
+#   - 起動後の検証に失敗したら旧ツリー(必要ならプロファイル退避も)へ戻して起動し直し、その版を以後見送る。
+#   - 停止後にこのスクリプトが中断・強制終了されたら、EXIT トラップで squashfs-root を戻して起動する。
+set -euo pipefail
+shopt -s nullglob
+
+CONFIG=${ORCA_AUTO_UPDATE_CONFIG:-/etc/default/orca-auto-update}
+# shellcheck source=config.example
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+REPO=${ORCA_REPO:-stablyai/orca}
+BASE=${ORCA_BASE:-/opt/orca}
+SVC=${ORCA_SERVICE:-orca-serve}
+SVCUSER=${ORCA_SVC_USER:-}
+PORT=${ORCA_PORT:-6768}
+STATE=${ORCA_STATE_DIR:-/var/lib/orca-auto-update}
+MIN_AGE_H=${ORCA_MIN_AGE_H:-24}   # 公開から この時間たった版だけを入れる(公開直後の不良版を避ける)
+KEEP_OLD=${ORCA_KEEP_OLD:-2}      # 保持する旧ツリー数・プロファイル退避数
+[ -n "$SVCUSER" ] || { echo "ERROR: $CONFIG に ORCA_SVC_USER(orca serve を動かすユーザ)を設定すること"; exit 1; }
+SVCHOME=$(getent passwd "$SVCUSER" | cut -d: -f6)
+[ -n "$SVCHOME" ] || { echo "ERROR: ユーザ $SVCUSER が存在しない"; exit 1; }
+PROFILE=${ORCA_PROFILE:-$SVCHOME/.config/orca}
+[[ "$MIN_AGE_H" =~ ^[0-9]+$ && "$KEEP_OLD" =~ ^[1-9][0-9]*$ && "$PORT" =~ ^[0-9]+$ ]] || { echo "ERROR: ORCA_MIN_AGE_H / ORCA_KEEP_OLD / ORCA_PORT が数値でない"; exit 1; }
+[ "$(uname -m)" = x86_64 ] || { echo "ERROR: x86_64 のみ対応(orca-linux.AppImage を使う)"; exit 1; }
+CGDIR=/sys/fs/cgroup/system.slice/$SVC.service
+CG=$CGDIR/cgroup.procs
+CURL=(curl -fsSL --proto '=https' --tlsv1.2 --retry 3)
+
+# 停止後の中断に備えた状態(on_exit が参照する)
+STOPPED=0
+SWAP_CUR=""
+
+ver_of() { grep -o 'X-AppImage-Version=[0-9.]*' "$1/orca-ide.desktop" 2>/dev/null | cut -d= -f2 || true; }
+sha_of() { openssl dgst -sha512 -binary "$1" | base64 -w0; }
+# journal に資格情報(deviceToken・ペアリングコード)を残さない。行を落としても 0 を返すよう sed だけで書く
+redact() { sed -E '/web client url|pairing url|pairing code|pair(ing)? (link|token)/Id; s/(code|token)=[A-Za-z0-9._~%+/=-]+/\1=<REDACTED>/gI'; }
+log() { echo "[orca-auto-update] $*"; }
+
+on_exit() {
+  local rc=$?
+  set +e   # 端末やパイプが消えていると echo が失敗する。復旧は最後まで走らせる
+  [ "$STOPPED" -eq 1 ] || return 0
+  log "!!! 停止中に中断された (rc=$rc)。サービスを復旧する"
+  if [ ! -d "$BASE/squashfs-root" ] && [ -n "$SWAP_CUR" ] && [ -d "$BASE/squashfs-root.$SWAP_CUR" ]; then
+    mv -T "$BASE/squashfs-root.$SWAP_CUR" "$BASE/squashfs-root" && log "squashfs-root.$SWAP_CUR を戻した"
+  fi
+  systemctl reset-failed $SVC
+  systemctl start $SVC
+  log "復旧後: $(systemctl is-active $SVC) / 配置版: $(ver_of "$BASE/squashfs-root")"
+}
+trap on_exit EXIT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+wait_cgroup_empty() {
+  local killed=0
+  while :; do
+    for _ in $(seq 1 60); do
+      { [ ! -e "$CG" ] || ! grep -q . "$CG"; } && return 0
+      sleep 1
+    done
+    if [ "$killed" -eq 0 ]; then
+      log "60秒経っても $SVC の cgroup にプロセスが残っている。強制終了して再待機する"
+      if [ -w "$CGDIR/cgroup.kill" ]; then echo 1 > "$CGDIR/cgroup.kill" || true; fi
+      xargs -r kill -KILL < "$CG" 2>/dev/null || true
+      killed=1
+      continue
+    fi
+    log "ERROR: 停止後も cgroup にプロセスが残っている"
+    return 1
+  done
+}
+
+# 停止して cgroup が空になるまで待つ
+stop_svc() {
+  systemctl stop $SVC || { log "ERROR: systemctl stop $SVC に失敗"; return 1; }
+  systemctl reset-failed $SVC || true
+  wait_cgroup_empty
+}
+
+start_svc() {
+  systemctl reset-failed $SVC || true
+  systemctl start $SVC || log "WARN: systemctl start $SVC が失敗を返した"
+}
+
+# 稼働中の実体が現 squashfs-root の版 $1 であることを確かめる。
+# daemon の --app-version は daemon 独自の版(0.1.0+<hash>)なので使わない
+verify_running() {
+  local want=$1 mp exe_ino tree_ino d
+  for _ in $(seq 1 60); do
+    ss -Hltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN && break
+    sleep 1
+  done
+  sleep 10   # 起動直後のクラッシュループを拾う
+  [ "$(systemctl is-active $SVC)" = active ] || { log "NG: $SVC が active でない"; return 1; }
+  [ "$(systemctl show -p NRestarts --value $SVC)" = 0 ] || { log "NG: NRestarts が 0 でない"; return 1; }
+  ss -Hltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN || { log "NG: :$PORT が LISTEN していない"; return 1; }
+  mp=$(systemctl show -p MainPID --value $SVC)
+  exe_ino=$(stat -L -c %i "/proc/$mp/exe" 2>/dev/null || echo none)
+  tree_ino=$(stat -c %i "$BASE/squashfs-root/orca-ide" 2>/dev/null || echo missing)
+  [ "$exe_ino" = "$tree_ino" ] || { log "NG: MainPID の exe が現 squashfs-root/orca-ide でない"; return 1; }
+  [ "$(ver_of "$BASE/squashfs-root")" = "$want" ] || { log "NG: 配置版が $want でない"; return 1; }
+  log "OK: $SVC は $want で稼働 (MainPID=$mp)"
+  # 致命ではないが、linger が切れていると次の再起動で全セッションが落ちる
+  for d in $(pgrep -u "$SVCUSER" -f "$PROFILE/orcad-artifacts/.*/daemon-entry.js" || true); do
+    if grep -q "$SVC\.service" "/proc/$d/cgroup" 2>/dev/null; then
+      log "WARN: terminal daemon (pid $d) が $SVC の cgroup 内にいる(linger 無効?)。次回の再起動でターミナルが落ちる"
+    fi
+  done
+  return 0
+}
+
+# 停止 → squashfs-root を $1 版のツリーへ入れ替え → 起動 → 検証。失敗したら元へ戻す。
+# 戻り値: 0=成功 / 1=新版の検証失敗(元へ戻した) / 2=前提・環境の失敗(新版の責任ではない)
+# if 条件の中で呼ばれ errexit が効かないので、各コマンドの失敗は明示的に扱う
+swap_to() {
+  local new=$1 cur
+  cur=$(ver_of "$BASE/squashfs-root")
+  [ -n "$cur" ] || { log "ERROR: 現行版を判定できない"; return 2; }
+  [ "$(ver_of "$BASE/squashfs-root.$new")" = "$new" ] || { log "ERROR: $BASE/squashfs-root.$new が $new のツリーでない"; return 2; }
+  [ ! -e "$BASE/squashfs-root.$cur" ] || { log "ERROR: $BASE/squashfs-root.$cur が既に存在する"; return 2; }
+
+  log "停止: $SVC ($cur)"
+  SWAP_CUR=$cur
+  STOPPED=1
+  if ! stop_svc; then
+    start_svc
+    STOPPED=0
+    return 2
+  fi
+
+  # プロファイル形式の移行に備えた退避。毎回作り直す
+  # (mv でなく cp: デバイスIDを変えると全クライアント再ペアリングになる)
+  rm -rf -- "$PROFILE.bak-$cur"
+  cp -a "$PROFILE" "$PROFILE.bak-$cur" || { log "ERROR: プロファイルの退避に失敗"; rm -rf -- "$PROFILE.bak-$cur"; start_svc; STOPPED=0; return 2; }
+
+  mv -T "$BASE/squashfs-root" "$BASE/squashfs-root.$cur" || { log "ERROR: 現行ツリーを退避できない"; start_svc; STOPPED=0; return 2; }
+  if ! mv -T "$BASE/squashfs-root.$new" "$BASE/squashfs-root"; then
+    log "ERROR: 新ツリーを配置できない。$cur を戻す"
+    mv -T "$BASE/squashfs-root.$cur" "$BASE/squashfs-root"
+    start_svc
+    STOPPED=0
+    return 2
+  fi
+  log "起動: $SVC ($new)"
+  start_svc
+  if verify_running "$new"; then
+    STOPPED=0
+    return 0
+  fi
+
+  log "!!! $new の起動検証に失敗。$cur へ戻す"
+  journalctl -u $SVC -n 40 -o cat --no-pager 2>/dev/null | redact || true
+  stop_svc || true
+  if mv -T "$BASE/squashfs-root" "$BASE/squashfs-root.$new" && mv -T "$BASE/squashfs-root.$cur" "$BASE/squashfs-root"; then
+    start_svc
+    if ! verify_running "$cur"; then
+      # 新版がプロファイルを移行して旧版が読めなくなった可能性。新版の稼働は高々数十秒なので退避を戻す
+      log "!!! $cur でも起動しない。プロファイルを退避から戻して再試行する(現プロファイルは $PROFILE.failed-$new へ)"
+      stop_svc || true
+      rm -rf -- "$PROFILE.failed-$new"
+      if mv -T "$PROFILE" "$PROFILE.failed-$new" && cp -a "$PROFILE.bak-$cur" "$PROFILE"; then
+        start_svc
+        verify_running "$cur" || log "!!! プロファイルを戻しても $cur を確認できない。手動で確認すること: systemctl status $SVC"
+      else
+        log "!!! プロファイルを戻せない。手動で確認すること"
+        start_svc
+      fi
+    fi
+  else
+    log "!!! ツリーを戻せない。手動で確認すること: ls -la $BASE"
+    start_svc
+  fi
+  STOPPED=0
+  return 1
+}
+
+tree_in_use() {
+  local e
+  for e in /proc/[0-9]*/exe; do
+    case "$(readlink "$e" 2>/dev/null)" in "$1"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+# 古い旧ツリーとプロファイル退避を消す(新しい順に KEEP_OLD 個残す)。稼働中プロセスが使うツリーは残す
+prune() {
+  local p
+  local -a old
+  mapfile -t old < <(printf '%s\n' "$BASE"/squashfs-root.[0-9]* | sort -V | head -n -"$KEEP_OLD")
+  for p in "${old[@]}"; do
+    [ -n "$p" ] || continue
+    if tree_in_use "$p"; then
+      log "使用中なので残す: $p"
+      continue
+    fi
+    if rm -rf -- "$p"; then log "削除: $p"; else log "WARN: 削除に失敗: $p"; fi
+  done
+  mapfile -t old < <(printf '%s\n' "$PROFILE".bak-[0-9]* | sort -V | head -n -"$KEEP_OLD")
+  for p in "${old[@]}"; do
+    [ -n "$p" ] || continue
+    if rm -rf -- "$p"; then log "削除: $p"; else log "WARN: 削除に失敗: $p"; fi
+  done
+  return 0
+}
+
+# AppImage を実行せずに中の squashfs を展開する(offset = ランタイム ELF の終端)
+extract_appimage() {
+  local img=$1 dest=$2 off
+  off=$(readelf -h "$img" | awk '/Start of section headers/{s=$5} /Size of section headers/{z=$5} /Number of section headers/{n=$5} END{print s+z*n}')
+  [ "${off:-0}" -gt 0 ] || { log "ERROR: AppImage の squashfs offset を求められない"; return 1; }
+  unsquashfs -q -n -no-xattrs -o "$off" -d "$dest" "$img" >/dev/null
+}
+
+# ツリーの外を指す symlink があれば拒否する(chown -R がツリー外に及ばないようにする)
+check_symlinks() {
+  local tree=$1 l t
+  while IFS= read -r -d '' l; do
+    t=$(realpath -m -- "$l")
+    case "$t" in "$tree"/*) ;; *) log "ERROR: ツリー外を指す symlink: $l -> $(readlink -- "$l")"; return 1 ;; esac
+  done < <(find "$tree" -type l -print0)
+}
+
+do_rollback() {
+  local to=$1 cur rc=0
+  cur=$(ver_of "$BASE/squashfs-root")
+  swap_to "$to" || rc=$?
+  [ "$rc" -eq 0 ] || exit "$rc"
+  # 戻した元の版は、hold 解除後に再導入しないよう見送る
+  [ -n "$cur" ] && touch "$STATE/failed-$cur"
+  echo "rollback $cur -> $to at $(date -Is)" > "$STATE/hold"
+  log "$to へ戻した。$cur は見送り、自動更新は保留中(解除: rm $STATE/hold)"
+}
+
+do_update() {
+  local min_age_h=$1 cur new tag published age_h yml want_sha want_size dl ex avail_kb smoke rc=0
+  if [ -e "$STATE/hold" ]; then
+    log "保留中のため更新しない: $(cat "$STATE/hold")"
+    return 0
+  fi
+  cur=$(ver_of "$BASE/squashfs-root")
+  [ -n "$cur" ] || { log "ERROR: 現行版を判定できない"; return 1; }
+
+  read -r tag published < <("${CURL[@]}" --max-time 60 "https://api.github.com/repos/$REPO/releases/latest" |
+    python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(d["tag_name"], d["published_at"])') || true
+  new=${tag#v}
+  [[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { log "ERROR: 最新リリースを取得できない、または想定外のタグ '${tag:-}'"; return 1; }
+  if [ "$new" = "$cur" ]; then
+    log "最新 ($cur)"
+    return 0
+  fi
+  if [ "$(printf '%s\n%s\n' "$cur" "$new" | sort -V | tail -1)" != "$new" ]; then
+    log "最新リリース $new が現行 $cur より古いので何もしない"
+    return 0
+  fi
+  if [ -e "$STATE/failed-$new" ]; then
+    log "ERROR: $new は見送り中($STATE/failed-$new を消すと再試行する)。現行 $cur"
+    return 1
+  fi
+  age_h=$(( ( $(date +%s) - $(date -d "$published" +%s) ) / 3600 ))
+  if [ "$age_h" -lt "$min_age_h" ]; then
+    log "$new は公開から ${age_h}時間。${min_age_h}時間たつまで待つ(現行 $cur)"
+    return 0
+  fi
+  log "更新: $cur -> $new (公開から ${age_h}時間)"
+
+  # ダウンロードと照合(root 専用ディレクトリで行う)
+  dl="$STATE/dl"
+  rm -rf -- "$dl"
+  install -d -m 0700 "$dl"
+  "${CURL[@]}" --max-time 60 -o "$dl/latest-linux.yml" "https://github.com/$REPO/releases/download/$tag/latest-linux.yml"
+  yml=$(cat "$dl/latest-linux.yml")
+  grep -qx "version: $new" <<<"$yml" || { log "ERROR: latest-linux.yml の version が $new でない"; return 1; }
+  want_sha=$(awk '/^ *- url: orca-linux.AppImage$/{f=1;next} f&&/sha512:/{print $2;exit}' <<<"$yml")
+  want_size=$(awk '/^ *- url: orca-linux.AppImage$/{f=1;next} f&&/size:/{print $2;exit}' <<<"$yml")
+  [ -n "$want_sha" ] && [ -n "$want_size" ] || { log "ERROR: latest-linux.yml から sha512/size を読めない"; return 1; }
+  "${CURL[@]}" --max-time 900 -o "$dl/orca-linux.AppImage" "https://github.com/$REPO/releases/download/$tag/orca-linux.AppImage"
+  [ "$(stat -c %s "$dl/orca-linux.AppImage")" = "$want_size" ] || { log "ERROR: サイズ不一致"; return 1; }
+  [ "$(sha_of "$dl/orca-linux.AppImage")" = "$want_sha" ] || { log "ERROR: sha512 不一致"; return 1; }
+  log "ダウンロード・照合 OK"
+
+  # 稼働中に展開・配置・スモークテスト
+  avail_kb=$(df -Pk "$BASE" | awk 'NR==2{print $4}')
+  [ "$avail_kb" -gt 3000000 ] || { log "ERROR: $BASE の空き容量不足 (${avail_kb}KB)"; return 1; }
+  ex="$BASE/.extract-$new"
+  rm -rf -- "$ex"
+  if [ -e "$BASE/squashfs-root.$new" ]; then
+    # 前回の中断の残骸。版を確認できたものだけ作り直す
+    [ "$(ver_of "$BASE/squashfs-root.$new")" = "$new" ] || { log "ERROR: $BASE/squashfs-root.$new が $new のツリーでない。手動で確認すること"; return 1; }
+    rm -rf -- "$BASE/squashfs-root.$new"
+  fi
+  mkdir -p "$ex"
+  extract_appimage "$dl/orca-linux.AppImage" "$ex/squashfs-root" 9>&- || { log "ERROR: 展開に失敗"; rm -rf -- "$ex"; return 1; }
+  [ "$(ver_of "$ex/squashfs-root")" = "$new" ] || { log "ERROR: 展開結果が $new でない"; rm -rf -- "$ex"; return 1; }
+  check_symlinks "$ex/squashfs-root" || { rm -rf -- "$ex"; return 1; }
+  chown -hR root:root "$ex/squashfs-root"
+  chmod -R a+rX,go-w "$ex/squashfs-root"
+  mv -T "$ex/squashfs-root" "$BASE/squashfs-root.$new"
+  rmdir "$ex"
+  rm -rf -- "$dl"
+  smoke=$(cd / && runuser -u "$SVCUSER" -- env -i HOME="$SVCHOME" PATH=/usr/bin:/bin \
+    timeout 60 "$BASE/squashfs-root.$new/AppRun" --version 2>&1 9>&-) || true
+  if ! grep -qx "$new" <<<"$smoke"; then
+    log "ERROR: 配置先から $new を起動できない。サービスは無停止のまま中断:"
+    printf '%s\n' "$smoke" | redact | tail -20
+    rm -rf -- "$BASE/squashfs-root.$new"
+    touch "$STATE/failed-$new"
+    return 1
+  fi
+  log "スモークテスト OK"
+
+  swap_to "$new" || rc=$?
+  case "$rc" in
+    0) ;;
+    1)
+      touch "$STATE/failed-$new"
+      # 戻し損ねて稼働ツリーになっている場合は消さない
+      if [ -d "$BASE/squashfs-root.$new" ] && [ "$(ver_of "$BASE/squashfs-root")" != "$new" ]; then
+        rm -rf -- "$BASE/squashfs-root.$new"
+      fi
+      return 1 ;;
+    *)
+      log "ERROR: 前提・環境の問題で入れ替えなかった。$new は次回再試行する"
+      return 1 ;;
+  esac
+  prune
+  log "完了: $new"
+}
+
+[ "$(id -u)" -eq 0 ] || { echo "root で実行すること"; exit 1; }
+if grep -q "$SVC\.service" /proc/self/cgroup; then
+  # Orca のターミナルから直接実行すると、stop で自分自身が殺されて入れ替えが中途半端になる
+  echo "ERROR: $SVC の cgroup 内で動いている。sudo systemctl start orca-auto-update.service で実行すること"
+  exit 1
+fi
+install -d -m 0700 "$STATE"
+exec 9>"$STATE/lock"
+flock -n 9 || { log "別の orca-auto-update が実行中"; exit 1; }
+
+case "${1:-}" in
+  "") do_update "$MIN_AGE_H" ;;
+  --no-wait) do_update 0 ;;
+  --rollback)
+    [[ "${2:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "usage: $0 --rollback <version>"; exit 2; }
+    do_rollback "$2" ;;
+  *) echo "usage: $0 [--no-wait | --rollback <version>]"; exit 2 ;;
+esac
