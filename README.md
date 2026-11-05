@@ -36,24 +36,35 @@ systemd timer で毎日自動更新するスクリプト一式。
 
 ## 前提
 
-- `orca serve` が system unit(既定 `orca-serve.service`)として、`<BASE>/squashfs-root/AppRun serve ...`
-  を `ExecStart` にして動いていること。初回構築は [docs/setup.md](docs/setup.md)
-- Ubuntu 24.04 で確認。`squashfs-tools` `binutils` `curl` `openssl` `python3` `util-linux` が必要
+- Ubuntu 24.04(x86_64)で確認。足りないパッケージは `install.sh` が apt で入れる
+- 既存ホストでは、`orca serve` が system unit(既定 `orca-serve.service`)として、
+  `<BASE>/squashfs-root/AppRun serve ...` を `ExecStart` にして動いていること
 
 ## 導入
 
 ```bash
 git clone https://github.com/ttrip-ngs/orca-auto-update.git
 cd orca-auto-update
-sudo bash install.sh --user <orca serve を動かすユーザ> --update-now
+sudo bash install.sh --user <orca serve を動かすユーザ>
 ```
 
+まっさらな Ubuntu でも既存ホストでも同じコマンドでよい。揃っているものには触らず、足りないものだけを用意する。
+最後に接続用の URL(ブラウザ用の Web client URL と、Orca アプリ用の Pairing URL)を表示する。
+URL は資格情報を含むので、チャットやチケットに貼らないこと。
+
+- 足りないパッケージを入れる。Orca が未配置なら、実行に必要なライブラリも入れて、公開から 24 時間たった最新の版を配置する
 - `/etc/default/orca-auto-update` を作り(既にあればそのまま使う)、linger を有効にし、
   `/usr/local/sbin/orca-auto-update` と unit を入れて timer を有効にする。設定項目は [config.example](config.example)
+- `orca serve` の unit が無ければ作って起動する。接続先は既定経路のアドレスになる。VPN など別のアドレスで
+  接続するなら `--pairing-address <アドレス>` を付ける(既存の unit は変更しない)
+- ファイアウォールは変更しない。`orca serve` は全インタフェースの 6768 番で待ち受けるので、届く範囲を絞ること
+  (ufw が有効で 6768 番を許可していなければ、許可の例を表示する)。Orca のエージェントは指定したユーザの権限
+  (sudo / docker グループに入っていれば実質 root)で動く
 - `--update-now` はその場で最新版へ更新する(公開からの待ち時間を飛ばす)。**SSH 端末から実行すること。**
   Orca のターミナル内では中断する
-- linger を有効にする前から動いている daemon はサービスの cgroup 内にいるので、導入後最初の再起動でだけ、
-  その時点のターミナルが落ちる。結果の最後に表示される daemon の cgroup が `user.slice` 配下なら、以後は落ちない
+- 既存ホストでは、linger を有効にする前から動いている daemon はサービスの cgroup 内にいるので、導入後最初の
+  再起動でだけ、その時点のターミナルが落ちる。`--update-now` の結果の最後に表示される daemon の cgroup が
+  `user.slice` 配下なら、以後は落ちない
 
 ## 運用
 
@@ -89,10 +100,12 @@ sudo rm /var/lib/orca-auto-update/failed-<版>      # 見送った版を再試�
 ```bash
 pre-commit run --all-files
 docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash /src/tests/failure-paths.sh
+bash tests/fresh-install.sh
 ```
 
 `tests/failure-paths.sh` は systemctl をスタブにして、ロールバック・新版の起動失敗・プロファイル移行後の復旧・
 停止中の強制終了・引数検証・更新する版の選択を確かめる。
+`tests/fresh-install.sh` は systemd 入りコンテナで本物の Orca を取得し、新規導入・再実行・実際の更新を確かめる。
 
 ## License
 
