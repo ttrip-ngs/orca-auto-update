@@ -24,3 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash /src/tests/failure-paths.sh
+
+  fresh-install:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash tests/fresh-install.sh

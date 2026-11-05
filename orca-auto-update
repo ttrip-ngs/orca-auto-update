@@ -7,6 +7,7 @@
 #   sudo systemctl start orca-auto-update.service          # 今すぐ確認・更新(公開から MIN_AGE_H たった版のうち最新を入れる)
 #   sudo systemd-run --wait --collect -u orca-auto-update-now /usr/local/sbin/orca-auto-update --no-wait
 #                                                          # 経過時間待ちを飛ばして今すぐ更新
+#   /usr/local/sbin/orca-auto-update --bootstrap           # 新規ホストに Orca を配置する(install.sh が呼ぶ。既にあれば何もしない)
 #   sudo systemd-run --wait --collect -u orca-auto-update-rb /usr/local/sbin/orca-auto-update --rollback <version>
 #                                                          # 保持している旧ツリーへ戻し、戻した元の版を見送り、自動更新を保留する
 #   sudo rm /var/lib/orca-auto-update/hold                 # 保留を解除する
@@ -292,40 +293,10 @@ else:
 ' "$@"
 }
 
-do_update() {
-  local min_age_h=$1 cur action new tag age_h skipped yml want_sha want_size dl ex avail_kb smoke rc=0
-  if [ -e "$STATE/hold" ]; then
-    log "保留中のため更新しない: $(cat "$STATE/hold")"
-    return 0
-  fi
-  cur=$(ver_of "$BASE/squashfs-root")
-  [ -n "$cur" ] || { log "ERROR: 現行版を判定できない"; return 1; }
-
-  action=""
-  read -r action new age_h skipped < <("${CURL[@]}" --max-time 60 "https://api.github.com/repos/$REPO/releases?per_page=30" |
-    select_release "$cur" "$min_age_h" "$STATE"/failed-*) || true
-  case "$action" in
-    update) ;;
-    latest)
-      log "最新 ($cur)"
-      return 0 ;;
-    older)
-      log "最新リリース $new が現行 $cur より古いので何もしない"
-      return 0 ;;
-    wait)
-      log "$new は公開から ${age_h}時間。${min_age_h}時間たつまで待つ(現行 $cur)"
-      return 0 ;;
-    failed)
-      log "ERROR: $cur より新しい版はすべて見送り中で最新は $new($STATE/failed-<版> を消すと再試行する)"
-      return 1 ;;
-    *)
-      log "ERROR: リリース一覧を取得できない、または解析できない"
-      return 1 ;;
-  esac
-  tag="v$new"
-  [ "$skipped" = - ] || log "見送り中の版を飛ばす: $skipped"
-  log "更新: $cur -> $new (公開から ${age_h}時間)"
-
+# リリース $1(タグ)を取得・照合して <BASE>/squashfs-root.$2 に展開する。
+# 途中の失敗は errexit に任せるので、if や || の中で呼ばないこと
+fetch_tree() {
+  local tag=$1 new=$2 yml want_sha want_size dl ex avail_kb
   # ダウンロードと照合(root 専用ディレクトリで行う)
   dl="$STATE/dl"
   rm -rf -- "$dl"
@@ -360,16 +331,80 @@ do_update() {
   mv -T "$ex/squashfs-root" "$BASE/squashfs-root.$new"
   rmdir "$ex"
   rm -rf -- "$dl"
+}
+
+# 配置先のツリー $1 版をサービスユーザで起動できるか確かめる。失敗したらツリーを消して 1 を返す
+smoke_tree() {
+  local new=$1 smoke
   smoke=$(cd / && runuser -u "$SVCUSER" -- env -i HOME="$SVCHOME" PATH=/usr/bin:/bin \
     timeout 60 "$BASE/squashfs-root.$new/AppRun" --version 2>&1 9>&-) || true
   if ! grep -qx "$new" <<<"$smoke"; then
     log "ERROR: 配置先から $new を起動できない。サービスは無停止のまま中断:"
     printf '%s\n' "$smoke" | redact | tail -20
     rm -rf -- "$BASE/squashfs-root.$new"
-    touch "$STATE/failed-$new"
     return 1
   fi
   log "スモークテスト OK"
+}
+
+pick_release() { # $1=現行版 $2=公開からの最低経過時間
+  "${CURL[@]}" --max-time 60 "https://api.github.com/repos/$REPO/releases?per_page=30" |
+    select_release "$1" "$2" "$STATE"/failed-*
+}
+
+# 新規ホスト向け: squashfs-root が無いときだけ、更新と同じ基準で選んだ版を配置する(サービスは触らない)
+do_bootstrap() {
+  local action="" new tag age_h skipped
+  if [ -e "$BASE/squashfs-root" ]; then
+    log "$BASE/squashfs-root は既にある。何もしない"
+    return 0
+  fi
+  read -r action new age_h skipped < <(pick_release 0.0.0 "$MIN_AGE_H") || true
+  [ "$action" = update ] || { log "ERROR: 配置できる版を選べない (${action:-リリース一覧を取得できない})"; return 1; }
+  tag="v$new"
+  log "初回配置: $new (公開から ${age_h}時間)"
+  install -d -m 0755 "$BASE"
+  fetch_tree "$tag" "$new"
+  smoke_tree "$new" || return 1
+  mv -T "$BASE/squashfs-root.$new" "$BASE/squashfs-root"
+  log "配置完了: $BASE/squashfs-root ($new)"
+}
+
+do_update() {
+  local min_age_h=$1 cur action new tag age_h skipped rc=0
+  if [ -e "$STATE/hold" ]; then
+    log "保留中のため更新しない: $(cat "$STATE/hold")"
+    return 0
+  fi
+  cur=$(ver_of "$BASE/squashfs-root")
+  [ -n "$cur" ] || { log "ERROR: 現行版を判定できない"; return 1; }
+
+  action=""
+  read -r action new age_h skipped < <(pick_release "$cur" "$min_age_h") || true
+  case "$action" in
+    update) ;;
+    latest)
+      log "最新 ($cur)"
+      return 0 ;;
+    older)
+      log "最新リリース $new が現行 $cur より古いので何もしない"
+      return 0 ;;
+    wait)
+      log "$new は公開から ${age_h}時間。${min_age_h}時間たつまで待つ(現行 $cur)"
+      return 0 ;;
+    failed)
+      log "ERROR: $cur より新しい版はすべて見送り中で最新は $new($STATE/failed-<版> を消すと再試行する)"
+      return 1 ;;
+    *)
+      log "ERROR: リリース一覧を取得できない、または解析できない"
+      return 1 ;;
+  esac
+  tag="v$new"
+  [ "$skipped" = - ] || log "見送り中の版を飛ばす: $skipped"
+  log "更新: $cur -> $new (公開から ${age_h}時間)"
+
+  fetch_tree "$tag" "$new"
+  smoke_tree "$new" || { touch "$STATE/failed-$new"; return 1; }
 
   swap_to "$new" || rc=$?
   case "$rc" in
@@ -402,8 +437,9 @@ flock -n 9 || { log "別の orca-auto-update が実行中"; exit 1; }
 case "${1:-}" in
   "") do_update "$MIN_AGE_H" ;;
   --no-wait) do_update 0 ;;
+  --bootstrap) do_bootstrap ;;
   --rollback)
     [[ "${2:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "usage: $0 --rollback <version>"; exit 2; }
     do_rollback "$2" ;;
-  *) echo "usage: $0 [--no-wait | --rollback <version>]"; exit 2 ;;
+  *) echo "usage: $0 [--no-wait | --bootstrap | --rollback <version>]"; exit 2 ;;
 esac
