@@ -21,7 +21,8 @@ systemd timer で毎日自動更新するスクリプト一式。
 
 毎日 04:00 JST に次を行う(`orca-auto-update.timer`)。
 
-1. GitHub の最新リリースを確認する。公開から 24 時間たっていない版、見送り中の版、保留中なら何もしない
+1. GitHub のリリース一覧から、公開から 24 時間たった安定版のうち最新の版を選ぶ(見送り中の版は飛ばす)。
+   該当する版がない、または保留中なら何もしない
 2. `orca-linux.AppImage` を取得し、同じリリースの `latest-linux.yml` のサイズ・sha512 と照合する
 3. **稼働中に** AppImage を実行せずに `unsquashfs` で展開し、`<BASE>/squashfs-root.<新版>` に置く
    (root 所有。ツリー外を指す symlink があれば拒否)。サービスユーザで `AppRun --version` を確認する
@@ -60,9 +61,9 @@ sudo bash install.sh --user <orca serve を動かすユーザ> --update-now
 journalctl -u orca-auto-update                 # 結果
 systemctl list-timers orca-auto-update.timer   # 次回の実行
 
-# 今すぐ確認・更新(公開からの待ち時間は有効)
+# 今すぐ確認・更新(公開から 24 時間たった版のうち最新を入れる)
 sudo systemctl start orca-auto-update.service
-# 待ち時間を飛ばして今すぐ更新
+# 待ち時間を飛ばして最新版へ今すぐ更新
 sudo systemd-run --wait --collect -u orca-auto-update-now /usr/local/sbin/orca-auto-update --no-wait
 # 旧版へ戻す(戻した元の版を見送り、自動更新を保留する)
 sudo systemd-run --wait --collect -u orca-auto-update-rb /usr/local/sbin/orca-auto-update --rollback <版>
@@ -77,7 +78,7 @@ sudo rm /var/lib/orca-auto-update/failed-<版>      # 見送った版を再試�
 ## セキュリティ上の注意
 
 - sha512 は同じリリースから取るので、保証するのは転送の完全性だけで真正性ではない(Orca は署名を配布していない)。
-  リリース元のアカウントが侵害された場合は防げない。公開から 24 時間待つことで、不良版・取り下げ版を避ける
+  リリース元のアカウントが侵害された場合は防げない。公開から 24 時間たった版だけを入れることで、不良版・取り下げ版を避ける
 - 取得した AppImage は root で実行しない(展開は `unsquashfs`、版の確認はサービスユーザ)
 - journal に `Web client URL` / `Pairing URL` 行(deviceToken を含む)を出さない
 - 失敗は journal に残るだけなので、`systemctl is-failed orca-auto-update` と `orca-serve` の稼働を
@@ -91,7 +92,7 @@ docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash /src/tests/failure-paths.sh
 ```
 
 `tests/failure-paths.sh` は systemctl をスタブにして、ロールバック・新版の起動失敗・プロファイル移行後の復旧・
-停止中の強制終了・引数検証を確かめる。
+停止中の強制終了・引数検証・更新する版の選択を確かめる。
 
 ## License
 
