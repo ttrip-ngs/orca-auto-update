@@ -47,7 +47,7 @@ printf '#!/bin/bash\nexit 1\n' > /usr/local/stub/pgrep
 cat > /usr/local/stub/curl <<'EOF'
 #!/bin/bash
 case "$*" in
-  *api.github.com*) exec cat /run/fake/releases.json ;;
+  *'releases?per_page='*) exec cat /run/fake/releases.json ;;
 esac
 exit 22
 EOF
@@ -118,12 +118,14 @@ run; rc=$?
 check "rc=1" "[ $rc -eq 1 ]"
 check "稼働は変わらない" '[ "$(running_ver)" = 1.4.240 ]'
 
-releases() { # 引数は "タグ 経過時間 [prerelease]" の並び
-  local item tag hours pre sep=""
+releases() { # 引数は "タグ 経過時間 [prerelease] [noassets]" の並び
+  local item tag hours pre noassets assets sep=""
   { echo '['; for item in "$@"; do
-      read -r tag hours pre <<<"$item"
-      printf '%s{"tag_name":"%s","draft":false,"prerelease":%s,"published_at":"%s"}\n' \
-        "$sep" "$tag" "${pre:-false}" "$(date -u -d "$hours hours ago" +%FT%TZ)"
+      read -r tag hours pre noassets <<<"$item"
+      assets='{"name":"latest-linux.yml","url":"https://example.invalid/yml"},{"name":"orca-linux.AppImage","url":"https://example.invalid/img"}'
+      [ -z "$noassets" ] || assets='{"name":"latest-linux.yml","url":"https://example.invalid/yml"}'
+      printf '%s{"tag_name":"%s","draft":false,"prerelease":%s,"published_at":"%s","assets":[%s]}\n' \
+        "$sep" "$tag" "${pre:-false}" "$(date -u -d "$hours hours ago" +%FT%TZ)" "$assets"
       sep=,
     done; echo ']'; } > $FAKE/releases.json
 }
@@ -142,11 +144,14 @@ reset; mktree /opt/orca/squashfs-root 1.4.245; systemctl start
 install -d -m 0700 /var/lib/orca-auto-update
 DAILY=("v1.4.250 8" "mobile-android-v0.0.64 13 true" "v1.4.249 19" "v1.4.248 64" "v1.4.251-rc.1 70 true" "v1.4.300 70 true" "v1.4.247 87" "v1.4.246 111")
 releases "${DAILY[@]}"
-select_case "最新が 24 時間未満なら、たった版のうち最新" 1.4.245 22 "更新: 1.4.245 -> 1.4.248 (公開から 64時間)"
-select_case "--no-wait は最新の安定版" 1.4.245 22 "更新: 1.4.245 -> 1.4.250" --no-wait
+select_case "最新が 24 時間未満なら、たった版のうち最新" 1.4.245 1 "更新: 1.4.245 -> 1.4.248 (公開から 64時間)"
+select_case "--no-wait は最新の安定版" 1.4.245 1 "更新: 1.4.245 -> 1.4.250" --no-wait
 touch /var/lib/orca-auto-update/failed-1.4.248
-select_case "見送り中の版は飛ばす" 1.4.245 22 "更新: 1.4.245 -> 1.4.247"
+select_case "見送り中の版は飛ばす" 1.4.245 1 "更新: 1.4.245 -> 1.4.247"
 rm /var/lib/orca-auto-update/failed-1.4.248
+releases "v1.4.248 30 false noassets" "v1.4.247 30"
+select_case "Linux の資産が揃っていない版は飛ばす" 1.4.245 1 "更新: 1.4.245 -> 1.4.247"
+select_case "取得できないファイルを示す" 1.4.245 1 "latest-linux.yml を取得できない: https://example.invalid/yml"
 releases "v1.4.246 8"
 select_case "24 時間たった版がなければ待つ" 1.4.245 0 "1.4.246 は公開から 8時間。24時間たつまで待つ"
 touch /var/lib/orca-auto-update/failed-1.4.246
@@ -161,7 +166,7 @@ releases "v1.4.244 50"
 select_case "取り下げで現行より古い" 1.4.245 0 "最新リリース 1.4.244 が現行 1.4.245 より古い"
 reset; mktree /opt/orca/squashfs-root 1.4.9; systemctl start
 releases "v1.4.9 90" "v1.4.10 30"
-select_case "版番号は数値で比べる" 1.4.9 22 "更新: 1.4.9 -> 1.4.10"
+select_case "版番号は数値で比べる" 1.4.9 1 "更新: 1.4.9 -> 1.4.10"
 releases "mobile-android-v0.0.64 30 true"
 select_case "安定版がなければエラー" 1.4.9 1 "解析できない"
 echo 'rate limited' > $FAKE/releases.json

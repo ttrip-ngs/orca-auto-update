@@ -256,8 +256,9 @@ do_rollback() {
 }
 
 # GET /releases の JSON(stdin)から入れる版を選び、1 行で出す。取得・解析に失敗したら何も出さず非 0 で終わる。
-#   update <版> <経過時間> <飛ばした見送り版(無ければ -)> / wait <版> <経過時間> / latest <版> / older <版> / failed <版>
+#   update <版> <経過時間> <飛ばした見送り版(無ければ -)> <latest-linux.yml の URL> <AppImage の URL> / wait <版> <経過時間> / latest <版> / older <版> / failed <版>
 # API の並びは公開順でなく、モバイル版や -rc のタグも混ざるので、安定版だけに絞って版番号で並べ直す。
+# github.com の直リンクは資産によって 504 を返し続けることがあるので、資産の API URL を使う。
 select_release() {
   python3 -I -c '
 import calendar, json, os, re, sys, time
@@ -269,11 +270,15 @@ def key(version):
     return tuple(int(n) for n in version.split("."))
 
 age_h = {}
+assets = {}
 for release in json.load(sys.stdin):
     tag = release["tag_name"]
-    if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag) and not release["draft"] and not release["prerelease"]:
+    urls = {a["name"]: a["url"] for a in release["assets"]}
+    if (re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag) and not release["draft"] and not release["prerelease"]
+            and "latest-linux.yml" in urls and "orca-linux.AppImage" in urls):
         published = calendar.timegm(time.strptime(release["published_at"], "%Y-%m-%dT%H:%M:%SZ"))
         age_h[tag[1:]] = int((time.time() - published) // 3600)
+        assets[tag[1:]] = urls
 if not age_h:
     sys.exit("安定版のリリースが見つからない")
 
@@ -287,27 +292,33 @@ elif not candidates:
     print("failed", newest)
 elif ready:
     skipped = [v for v in newer if v in failed and key(v) > key(ready[0])]
-    print("update", ready[0], age_h[ready[0]], ",".join(skipped) or "-")
+    urls = assets[ready[0]]
+    print("update", ready[0], age_h[ready[0]], ",".join(skipped) or "-", urls["latest-linux.yml"], urls["orca-linux.AppImage"])
 else:
     print("wait", candidates[0], age_h[candidates[0]])
 ' "$@"
 }
 
-# リリース $1(タグ)を取得・照合して <BASE>/squashfs-root.$2 に展開する。
+download() { # $1=資産の API URL $2=保存先 $3=タイムアウト(秒)
+  "${CURL[@]}" --max-time "$3" -H 'Accept: application/octet-stream' -o "$2" "$1" ||
+    { log "ERROR: ${2##*/} を取得できない: $1"; return 1; }
+}
+
+# 版 $1 の資産($2=latest-linux.yml, $3=AppImage の URL)を取得・照合して <BASE>/squashfs-root.$1 に展開する。
 # 途中の失敗は errexit に任せるので、if や || の中で呼ばないこと
 fetch_tree() {
-  local tag=$1 new=$2 yml want_sha want_size dl ex avail_kb
+  local new=$1 yml_url=$2 img_url=$3 yml want_sha want_size dl ex avail_kb
   # ダウンロードと照合(root 専用ディレクトリで行う)
   dl="$STATE/dl"
   rm -rf -- "$dl"
   install -d -m 0700 "$dl"
-  "${CURL[@]}" --max-time 60 -o "$dl/latest-linux.yml" "https://github.com/$REPO/releases/download/$tag/latest-linux.yml"
+  download "$yml_url" "$dl/latest-linux.yml" 60
   yml=$(cat "$dl/latest-linux.yml")
   grep -qx "version: $new" <<<"$yml" || { log "ERROR: latest-linux.yml の version が $new でない"; return 1; }
   want_sha=$(awk '/^ *- url: orca-linux.AppImage$/{f=1;next} f&&/sha512:/{print $2;exit}' <<<"$yml")
   want_size=$(awk '/^ *- url: orca-linux.AppImage$/{f=1;next} f&&/size:/{print $2;exit}' <<<"$yml")
   [ -n "$want_sha" ] && [ -n "$want_size" ] || { log "ERROR: latest-linux.yml から sha512/size を読めない"; return 1; }
-  "${CURL[@]}" --max-time 900 -o "$dl/orca-linux.AppImage" "https://github.com/$REPO/releases/download/$tag/orca-linux.AppImage"
+  download "$img_url" "$dl/orca-linux.AppImage" 900
   [ "$(stat -c %s "$dl/orca-linux.AppImage")" = "$want_size" ] || { log "ERROR: サイズ不一致"; return 1; }
   [ "$(sha_of "$dl/orca-linux.AppImage")" = "$want_sha" ] || { log "ERROR: sha512 不一致"; return 1; }
   log "ダウンロード・照合 OK"
@@ -354,24 +365,23 @@ pick_release() { # $1=現行版 $2=公開からの最低経過時間
 
 # 新規ホスト向け: squashfs-root が無いときだけ、更新と同じ基準で選んだ版を配置する(サービスは触らない)
 do_bootstrap() {
-  local action="" new tag age_h skipped
+  local action="" new age_h skipped yml_url img_url
   if [ -e "$BASE/squashfs-root" ]; then
     log "$BASE/squashfs-root は既にある。何もしない"
     return 0
   fi
-  read -r action new age_h skipped < <(pick_release 0.0.0 "$MIN_AGE_H") || true
+  read -r action new age_h skipped yml_url img_url < <(pick_release 0.0.0 "$MIN_AGE_H") || true
   [ "$action" = update ] || { log "ERROR: 配置できる版を選べない (${action:-リリース一覧を取得できない})"; return 1; }
-  tag="v$new"
   log "初回配置: $new (公開から ${age_h}時間)"
   install -d -m 0755 "$BASE"
-  fetch_tree "$tag" "$new"
+  fetch_tree "$new" "$yml_url" "$img_url"
   smoke_tree "$new" || return 1
   mv -T "$BASE/squashfs-root.$new" "$BASE/squashfs-root"
   log "配置完了: $BASE/squashfs-root ($new)"
 }
 
 do_update() {
-  local min_age_h=$1 cur action new tag age_h skipped rc=0
+  local min_age_h=$1 cur action new age_h skipped yml_url img_url rc=0
   if [ -e "$STATE/hold" ]; then
     log "保留中のため更新しない: $(cat "$STATE/hold")"
     return 0
@@ -380,7 +390,7 @@ do_update() {
   [ -n "$cur" ] || { log "ERROR: 現行版を判定できない"; return 1; }
 
   action=""
-  read -r action new age_h skipped < <(pick_release "$cur" "$min_age_h") || true
+  read -r action new age_h skipped yml_url img_url < <(pick_release "$cur" "$min_age_h") || true
   case "$action" in
     update) ;;
     latest)
@@ -399,11 +409,10 @@ do_update() {
       log "ERROR: リリース一覧を取得できない、または解析できない"
       return 1 ;;
   esac
-  tag="v$new"
   [ "$skipped" = - ] || log "見送り中の版を飛ばす: $skipped"
   log "更新: $cur -> $new (公開から ${age_h}時間)"
 
-  fetch_tree "$tag" "$new"
+  fetch_tree "$new" "$yml_url" "$img_url"
   smoke_tree "$new" || { touch "$STATE/failed-$new"; return 1; }
 
   swap_to "$new" || rc=$?
