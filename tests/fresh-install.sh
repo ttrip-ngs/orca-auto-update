@@ -49,8 +49,11 @@ check "展開済みツリーから起動している" '[ "$(stat -L -c %i /proc/
 check "timer が有効" 'systemctl is-enabled orca-auto-update.timer'
 check "linger が有効" '[ "$(loginctl show-user orca -p Linger --value)" = yes ]'
 check "NRestarts=0" '[ "$(systemctl show -p NRestarts --value orca-serve)" = 0 ]'
-check "既定経路のアドレスを unit に入れる" "grep -q -- \"--pairing-address $(cx 'ip route get 1.1.1.1 | sed -n \"s/.* src \\([^ ]*\\).*/\\1/p\"')\$\" /etc/systemd/system/orca-serve.service"
+addr=$(cx 'ip route get 1.1.1.1' | sed -n 's/.* src \([^ ]*\).*/\1/p')
+check "既定経路のアドレス ($addr) を unit に入れる" "[ -n '$addr' ] && grep -q -- '--pairing-address $addr\$' /etc/systemd/system/orca-serve.service"
 shown "Web client URL を表示する" "Web client URL: http://"
+# コンテナの外(別マシンの代わり)から、表示したアドレスの Web クライアントへ届くこと
+if curl -fsS --max-time 10 -o /dev/null "http://$addr:6768/web-index.html"; then echo "  ok: コンテナの外から接続できる"; else echo "  NG: コンテナの外から接続できない"; FAILS=$((FAILS + 1)); fi
 shown "Pairing URL を表示する" "Pairing URL: orca://pair?code="
 shown "ufw が閉じていれば案内する" "sudo ufw allow from"
 
