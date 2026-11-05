@@ -4,7 +4,7 @@
 # 設定は /etc/default/orca-auto-update(ORCA_SVC_USER は必須。他は既定値あり。config.example 参照)。
 # orca-auto-update.timer から root で毎日実行する。手動実行・ロールバックも専用 unit 経由で行う
 # (直接 sudo 実行すると、端末切断の SIGHUP で停止と起動の間に死ぬことがある):
-#   sudo systemctl start orca-auto-update.service          # 今すぐ確認・更新(公開からの経過時間待ちは有効)
+#   sudo systemctl start orca-auto-update.service          # 今すぐ確認・更新(公開から MIN_AGE_H たった版のうち最新を入れる)
 #   sudo systemd-run --wait --collect -u orca-auto-update-now /usr/local/sbin/orca-auto-update --no-wait
 #                                                          # 経過時間待ちを飛ばして今すぐ更新
 #   sudo systemd-run --wait --collect -u orca-auto-update-rb /usr/local/sbin/orca-auto-update --rollback <version>
@@ -254,8 +254,46 @@ do_rollback() {
   log "$to へ戻した。$cur は見送り、自動更新は保留中(解除: rm $STATE/hold)"
 }
 
+# GET /releases の JSON(stdin)から入れる版を選び、1 行で出す。取得・解析に失敗したら何も出さず非 0 で終わる。
+#   update <版> <経過時間> <飛ばした見送り版(無ければ -)> / wait <版> <経過時間> / latest <版> / older <版> / failed <版>
+# API の並びは公開順でなく、モバイル版や -rc のタグも混ざるので、安定版だけに絞って版番号で並べ直す。
+select_release() {
+  python3 -I -c '
+import calendar, json, os, re, sys, time
+
+cur, min_age_h = sys.argv[1], int(sys.argv[2])
+failed = {os.path.basename(p)[len("failed-"):] for p in sys.argv[3:]}
+
+def key(version):
+    return tuple(int(n) for n in version.split("."))
+
+age_h = {}
+for release in json.load(sys.stdin):
+    tag = release["tag_name"]
+    if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag) and not release["draft"] and not release["prerelease"]:
+        published = calendar.timegm(time.strptime(release["published_at"], "%Y-%m-%dT%H:%M:%SZ"))
+        age_h[tag[1:]] = int((time.time() - published) // 3600)
+if not age_h:
+    sys.exit("安定版のリリースが見つからない")
+
+newest = max(age_h, key=key)
+newer = sorted((v for v in age_h if key(v) > key(cur)), key=key, reverse=True)
+candidates = [v for v in newer if v not in failed]
+ready = [v for v in candidates if age_h[v] >= min_age_h]
+if not newer:
+    print("latest" if newest == cur else "older", newest)
+elif not candidates:
+    print("failed", newest)
+elif ready:
+    skipped = [v for v in newer if v in failed and key(v) > key(ready[0])]
+    print("update", ready[0], age_h[ready[0]], ",".join(skipped) or "-")
+else:
+    print("wait", candidates[0], age_h[candidates[0]])
+' "$@"
+}
+
 do_update() {
-  local min_age_h=$1 cur new tag published age_h yml want_sha want_size dl ex avail_kb smoke rc=0
+  local min_age_h=$1 cur action new tag age_h skipped yml want_sha want_size dl ex avail_kb smoke rc=0
   if [ -e "$STATE/hold" ]; then
     log "保留中のため更新しない: $(cat "$STATE/hold")"
     return 0
@@ -263,27 +301,29 @@ do_update() {
   cur=$(ver_of "$BASE/squashfs-root")
   [ -n "$cur" ] || { log "ERROR: 現行版を判定できない"; return 1; }
 
-  read -r tag published < <("${CURL[@]}" --max-time 60 "https://api.github.com/repos/$REPO/releases/latest" |
-    python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(d["tag_name"], d["published_at"])') || true
-  new=${tag#v}
-  [[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { log "ERROR: 最新リリースを取得できない、または想定外のタグ '${tag:-}'"; return 1; }
-  if [ "$new" = "$cur" ]; then
-    log "最新 ($cur)"
-    return 0
-  fi
-  if [ "$(printf '%s\n%s\n' "$cur" "$new" | sort -V | tail -1)" != "$new" ]; then
-    log "最新リリース $new が現行 $cur より古いので何もしない"
-    return 0
-  fi
-  if [ -e "$STATE/failed-$new" ]; then
-    log "ERROR: $new は見送り中($STATE/failed-$new を消すと再試行する)。現行 $cur"
-    return 1
-  fi
-  age_h=$(( ( $(date +%s) - $(date -d "$published" +%s) ) / 3600 ))
-  if [ "$age_h" -lt "$min_age_h" ]; then
-    log "$new は公開から ${age_h}時間。${min_age_h}時間たつまで待つ(現行 $cur)"
-    return 0
-  fi
+  action=""
+  read -r action new age_h skipped < <("${CURL[@]}" --max-time 60 "https://api.github.com/repos/$REPO/releases?per_page=30" |
+    select_release "$cur" "$min_age_h" "$STATE"/failed-*) || true
+  case "$action" in
+    update) ;;
+    latest)
+      log "最新 ($cur)"
+      return 0 ;;
+    older)
+      log "最新リリース $new が現行 $cur より古いので何もしない"
+      return 0 ;;
+    wait)
+      log "$new は公開から ${age_h}時間。${min_age_h}時間たつまで待つ(現行 $cur)"
+      return 0 ;;
+    failed)
+      log "ERROR: $cur より新しい版はすべて見送り中で最新は $new($STATE/failed-<版> を消すと再試行する)"
+      return 1 ;;
+    *)
+      log "ERROR: リリース一覧を取得できない、または解析できない"
+      return 1 ;;
+  esac
+  tag="v$new"
+  [ "$skipped" = - ] || log "見送り中の版を飛ばす: $skipped"
   log "更新: $cur -> $new (公開から ${age_h}時間)"
 
   # ダウンロードと照合(root 専用ディレクトリで行う)

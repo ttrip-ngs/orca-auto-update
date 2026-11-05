@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # orca-auto-update の入れ替え・失敗時の復旧を検証する。使い捨てコンテナ内で root として実行すること:
 #   docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash /src/tests/failure-paths.sh
-# systemctl / ss / journalctl はスタブ。orca-ide は sleep のコピーで、ツリー内の目印ファイルで挙動を変える:
+# systemctl / ss / journalctl / curl はスタブ。orca-ide は sleep のコピーで、ツリー内の目印ファイルで挙動を変える:
 #   BROKEN             起動に失敗する
 #   MIGRATES           起動時にプロファイルへ MIGRATED を作る(新版のプロファイル移行を模擬)
 #   NEEDS_OLD_PROFILE  プロファイルに MIGRATED があると起動に失敗する
@@ -11,6 +11,7 @@ SRC=$(cd "$(dirname "$0")/.." && pwd)
 FAKE=/run/fake
 FAILS=0
 
+command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3 >/dev/null; } || exit 1
 useradd -m orca 2>/dev/null || true
 PROFILE=/home/orca/.config/orca
 echo "ORCA_SVC_USER=orca" > /etc/default/orca-auto-update
@@ -42,6 +43,14 @@ exit 0
 EOF
 printf '#!/bin/bash\nexit 0\n' > /usr/local/stub/journalctl
 printf '#!/bin/bash\nexit 1\n' > /usr/local/stub/pgrep
+# リリース一覧は $FAKE/releases.json を返す。ダウンロードは失敗させ、版の選択までを確かめる
+cat > /usr/local/stub/curl <<'EOF'
+#!/bin/bash
+case "$*" in
+  *api.github.com*) exec cat /run/fake/releases.json ;;
+esac
+exit 22
+EOF
 chmod +x /usr/local/stub/*
 export PATH=/usr/local/stub:$PATH
 # 起動確認の固定待ち(10秒)だけ短くしたコピーを使う
@@ -108,6 +117,55 @@ echo "ORCA_SVC_USER=" > /etc/default/orca-auto-update
 run; rc=$?
 check "rc=1" "[ $rc -eq 1 ]"
 check "稼働は変わらない" '[ "$(running_ver)" = 1.4.240 ]'
+
+releases() { # 引数は "タグ 経過時間 [prerelease]" の並び
+  local item tag hours pre sep=""
+  { echo '['; for item in "$@"; do
+      read -r tag hours pre <<<"$item"
+      printf '%s{"tag_name":"%s","draft":false,"prerelease":%s,"published_at":"%s"}\n' \
+        "$sep" "$tag" "${pre:-false}" "$(date -u -d "$hours hours ago" +%FT%TZ)"
+      sep=,
+    done; echo ']'; } > $FAKE/releases.json
+}
+# $1=説明 $2=現行版 $3=期待する rc $4=期待するログ(grep -F)。追加の引数はスクリプトへ渡す
+select_case() {
+  local desc=$1 cur=$2 want_rc=$3 want_log=$4 out rc; shift 4
+  out=$("$U" "$@" 2>&1); rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  check "$desc: rc=$want_rc かつ「$want_log」" '[ "$rc" -eq "$want_rc" ] && grep -qF -- "$want_log" <<<"$out"'
+  check "$desc: 稼働は $cur のまま" '[ "$(running_ver)" = "$cur" ]'
+}
+
+echo "=== G. 更新する版の選択 ==="
+echo "ORCA_SVC_USER=orca" > /etc/default/orca-auto-update
+reset; mktree /opt/orca/squashfs-root 1.4.245; systemctl start
+install -d -m 0700 /var/lib/orca-auto-update
+DAILY=("v1.4.250 8" "mobile-android-v0.0.64 13 true" "v1.4.249 19" "v1.4.248 64" "v1.4.251-rc.1 70 true" "v1.4.300 70 true" "v1.4.247 87" "v1.4.246 111")
+releases "${DAILY[@]}"
+select_case "最新が 24 時間未満なら、たった版のうち最新" 1.4.245 22 "更新: 1.4.245 -> 1.4.248 (公開から 64時間)"
+select_case "--no-wait は最新の安定版" 1.4.245 22 "更新: 1.4.245 -> 1.4.250" --no-wait
+touch /var/lib/orca-auto-update/failed-1.4.248
+select_case "見送り中の版は飛ばす" 1.4.245 22 "更新: 1.4.245 -> 1.4.247"
+rm /var/lib/orca-auto-update/failed-1.4.248
+releases "v1.4.246 8"
+select_case "24 時間たった版がなければ待つ" 1.4.245 0 "1.4.246 は公開から 8時間。24時間たつまで待つ"
+touch /var/lib/orca-auto-update/failed-1.4.246
+releases "v1.4.247 8" "v1.4.246 30"
+select_case "見送り中の版より新しい版を待つ" 1.4.245 0 "1.4.247 は公開から 8時間"
+releases "v1.4.246 30"
+select_case "新しい版がすべて見送り中ならエラー" 1.4.245 1 "すべて見送り中"
+rm /var/lib/orca-auto-update/failed-1.4.246
+releases "v1.4.245 30" "v1.4.244 50"
+select_case "現行が最新" 1.4.245 0 "最新 (1.4.245)"
+releases "v1.4.244 50"
+select_case "取り下げで現行より古い" 1.4.245 0 "最新リリース 1.4.244 が現行 1.4.245 より古い"
+reset; mktree /opt/orca/squashfs-root 1.4.9; systemctl start
+releases "v1.4.9 90" "v1.4.10 30"
+select_case "版番号は数値で比べる" 1.4.9 22 "更新: 1.4.9 -> 1.4.10"
+releases "mobile-android-v0.0.64 30 true"
+select_case "安定版がなければエラー" 1.4.9 1 "解析できない"
+echo 'rate limited' > $FAKE/releases.json
+select_case "不正な応答ならエラー" 1.4.9 1 "解析できない"
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "ALL PASSED"; else echo "$FAILS 件失敗"; exit 1; fi
